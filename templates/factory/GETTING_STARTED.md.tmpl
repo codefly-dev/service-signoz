@@ -1,0 +1,24 @@
+# SigNoz setup
+
+Add a dedicated ClickHouse service named `clickhouse` in this module:
+
+```yaml
+name: clickhouse
+version: 0.0.0
+module: {{ .Module }}
+agent:
+  kind: codefly:service
+  name: clickhouse
+  publisher: codefly.dev
+  version: 0.0.9
+endpoints:
+  - name: tcp
+    api: tcp
+    visibility: private
+spec:
+  database-name: signoz
+  no-migration: true
+  docker-image: ghcr.io/codefly-dev/service-signoz-clickhouse:25.12.5-1@sha256:b52688dbbda87eb8caeede1d9cb8704fbf8d13772148bb03500d929383209652
+```
+
+Set `CLICKHOUSE_USER=signoz` and a dedicated `CLICKHOUSE_PASSWORD` in that service's local configuration. Set a random `SIGNOZ_TOKENIZER_JWT_SECRET` in this service's local secret configuration. For Kubernetes, map `CLICKHOUSE_DSN` (`tcp://user:password@clickhouse:9000`) and `SIGNOZ_TOKENIZER_JWT_SECRET` to externally managed Secret keys; the ClickHouse service maps the same username and password independently. The SigNoz migration workload owns its telemetry schemas; dashboard and alert provisioning belongs outside this runtime agent.

@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Name }}-query
+  namespace: "{{ .Namespace }}"
+spec:
+  serviceName: {{ .Name }}-query
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Name }}
+      app.kubernetes.io/component: query
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Name }}
+        app.kubernetes.io/component: query
+        app.kubernetes.io/part-of: {{ .Name }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: query
+          image: {{ .Deployment.Parameters.SigNozImage }}
+          imagePullPolicy: IfNotPresent
+          command: [/root/signoz]
+          args: [server]
+          workingDir: /var/lib/signoz
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ (index .SecretReferences "CLICKHOUSE_DSN").Name }}
+                  key: {{ (index .SecretReferences "CLICKHOUSE_DSN").Key }}
+                  optional: {{ (index .SecretReferences "CLICKHOUSE_DSN").Optional }}
+            - name: SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_CLUSTER
+              value: cluster
+            - name: SIGNOZ_TOKENIZER_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ (index .SecretReferences "SIGNOZ_TOKENIZER_JWT_SECRET").Name }}
+                  key: {{ (index .SecretReferences "SIGNOZ_TOKENIZER_JWT_SECRET").Key }}
+                  optional: {{ (index .SecretReferences "SIGNOZ_TOKENIZER_JWT_SECRET").Optional }}
+          startupProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health?live=1
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: signoz-data
+              mountPath: /var/lib/signoz
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: signoz-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

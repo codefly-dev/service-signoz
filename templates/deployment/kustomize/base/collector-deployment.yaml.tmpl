@@ -1,0 +1,138 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Name }}-collector
+  namespace: "{{ .Namespace }}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Name }}
+      app.kubernetes.io/component: collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Name }}
+        app.kubernetes.io/component: collector
+        app.kubernetes.io/part-of: {{ .Name }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: render-config
+          image: {{ .Deployment.Parameters.CollectorImage }}
+          imagePullPolicy: IfNotPresent
+          command: [/usr/bin/sh, -c]
+          args:
+            - |-
+              /usr/bin/awk '
+              function escaped(value) {
+                gsub(/\\/, "\\\\", value)
+                gsub(/&/, "\\&", value)
+                return value
+              }
+              {
+                line = $0
+                gsub(/CODEFLY_CLICKHOUSE_DSN/, escaped(ENVIRON["CLICKHOUSE_DSN"]), line)
+                print line
+              }
+              ' /source/otel-collector-config.yaml > /rendered/otel-collector-config.yaml
+          env:
+            - name: CLICKHOUSE_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ (index .SecretReferences "CLICKHOUSE_DSN").Name }}
+                  key: {{ (index .SecretReferences "CLICKHOUSE_DSN").Key }}
+                  optional: {{ (index .SecretReferences "CLICKHOUSE_DSN").Optional }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: collector-config-source
+              mountPath: /source
+              readOnly: true
+            - name: collector-config
+              mountPath: /rendered
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: collector
+          image: {{ .Deployment.Parameters.CollectorImage }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config=/conf/otel-collector-config.yaml
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: health
+              containerPort: 13133
+          startupProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: collector-config
+              mountPath: /conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: collector-config-source
+          configMap:
+            name: {{ .Name }}-collector
+        - name: collector-config
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

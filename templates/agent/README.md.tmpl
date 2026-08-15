@@ -1,0 +1,5 @@
+# SigNoz service
+
+Runs SigNoz 0.137.0 with a private OTLP collector and module-visible query and UI endpoints. A dedicated `codefly.dev/clickhouse:0.0.9` service provides persistent telemetry storage.
+
+The deployment bundle is transport-neutral Kubernetes YAML. It never creates ingress or serializes ClickHouse credentials; supply `CLICKHOUSE_DSN` and `SIGNOZ_TOKENIZER_JWT_SECRET` as Kubernetes Secret references.

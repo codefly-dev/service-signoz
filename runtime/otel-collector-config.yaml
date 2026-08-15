@@ -1,0 +1,87 @@
+connectors:
+  signozmeter:
+    metrics_flush_interval: 1h
+    dimensions:
+      - name: service.name
+      - name: deployment.environment
+      - name: host.name
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 16
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  batch:
+    send_batch_size: 50000
+    timeout: 1s
+  batch/meter:
+    send_batch_max_size: 25000
+    send_batch_size: 20000
+    timeout: 1s
+  signozspanmetrics/delta:
+    metrics_exporter: signozclickhousemetrics
+    latency_histogram_buckets: [100us, 1ms, 2ms, 6ms, 10ms, 50ms, 100ms, 250ms, 500ms, 1000ms, 1400ms, 2000ms, 5s, 10s, 20s, 40s, 60s]
+    dimensions_cache_size: 100000
+    dimensions:
+      - name: service.namespace
+        default: default
+      - name: deployment.environment
+        default: default
+      - name: signoz.collector.id
+    aggregation_temporality: AGGREGATION_TEMPORALITY_DELTA
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  zpages:
+    endpoint: localhost:55679
+  pprof:
+    endpoint: localhost:1777
+exporters:
+  clickhousetraces:
+    datasource: CODEFLY_CLICKHOUSE_DSN/signoz_traces
+    low_cardinal_exception_grouping: false
+    use_new_schema: true
+  signozclickhousemetrics:
+    dsn: CODEFLY_CLICKHOUSE_DSN/signoz_metrics
+    timeout: 45s
+  clickhouselogsexporter:
+    dsn: CODEFLY_CLICKHOUSE_DSN/signoz_logs
+    timeout: 10s
+    use_new_schema: true
+  metadataexporter:
+    enabled: true
+    dsn: CODEFLY_CLICKHOUSE_DSN/signoz_metadata
+    timeout: 10s
+    tenant_id: ""
+    cache:
+      provider: in_memory
+  signozclickhousemeter:
+    dsn: CODEFLY_CLICKHOUSE_DSN/signoz_meter
+    timeout: 45s
+    sending_queue:
+      enabled: false
+service:
+  telemetry:
+    logs:
+      encoding: json
+  extensions: [health_check, zpages, pprof]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [signozspanmetrics/delta, batch]
+      exporters: [clickhousetraces, metadataexporter, signozmeter]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [metadataexporter, signozclickhousemetrics, signozmeter]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [clickhouselogsexporter, metadataexporter, signozmeter]
+    metrics/meter:
+      receivers: [signozmeter]
+      processors: [batch/meter]
+      exporters: [signozclickhousemeter]
