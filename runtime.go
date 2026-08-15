@@ -213,9 +213,11 @@ func (s *Runtime) initCollector(ctx context.Context, clickhouse clickHouseConnec
 	if err != nil {
 		return err
 	}
+	if err = os.Chmod(configDir, 0o755); err != nil {
+		return err
+	}
 	baseDSN := "tcp://" + url.UserPassword(clickhouse.User, clickhouse.Password).String() + "@" + net.JoinHostPort(clickhouse.Host, clickhouse.Port)
-	collectorConfig = []byte(strings.ReplaceAll(string(collectorConfig), "CODEFLY_CLICKHOUSE_DSN", baseDSN))
-	if err = os.WriteFile(filepath.Join(configDir, "otel-collector-config.yaml"), collectorConfig, 0o600); err != nil {
+	if err = os.WriteFile(filepath.Join(configDir, "otel-collector-config.yaml"), collectorConfig, 0o644); err != nil {
 		return err
 	}
 	runner, err := dockerrun.NewDockerHeadlessEnvironment(ctx, collectorImage, s.UniqueWithWorkspace()+"-collector")
@@ -226,6 +228,7 @@ func (s *Runtime) initCollector(ctx context.Context, clickhouse clickHouseConnec
 	runner.WithPortMapping(ctx, s.otlpHTTPPort, 4318)
 	runner.WithPortMapping(ctx, s.healthPort, 13133)
 	runner.WithMount(configDir, "/conf")
+	runner.WithEnvironmentVariables(ctx, resources.Env("CLICKHOUSE_DSN", baseDSN))
 	runner.WithCommand(
 		"--config=/conf/otel-collector-config.yaml",
 	)

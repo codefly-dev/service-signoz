@@ -45,6 +45,8 @@ func TestCompanionClickHouseConfiguration(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(collectorConfig), "clickhousetraces:")
 	require.Contains(t, string(collectorConfig), "signozspanmetrics/delta")
+	require.Contains(t, string(collectorConfig), "${env:CLICKHOUSE_DSN}")
+	require.NotContains(t, string(collectorConfig), "tcp://")
 
 	config, err := os.ReadFile("clickhouse/config.d/signoz-cluster.xml")
 	require.NoError(t, err)

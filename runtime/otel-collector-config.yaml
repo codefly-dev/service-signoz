@@ -41,25 +41,25 @@ extensions:
     endpoint: localhost:1777
 exporters:
   clickhousetraces:
-    datasource: CODEFLY_CLICKHOUSE_DSN/signoz_traces
+    datasource: ${env:CLICKHOUSE_DSN}/signoz_traces
     low_cardinal_exception_grouping: false
     use_new_schema: true
   signozclickhousemetrics:
-    dsn: CODEFLY_CLICKHOUSE_DSN/signoz_metrics
+    dsn: ${env:CLICKHOUSE_DSN}/signoz_metrics
     timeout: 45s
   clickhouselogsexporter:
-    dsn: CODEFLY_CLICKHOUSE_DSN/signoz_logs
+    dsn: ${env:CLICKHOUSE_DSN}/signoz_logs
     timeout: 10s
     use_new_schema: true
   metadataexporter:
     enabled: true
-    dsn: CODEFLY_CLICKHOUSE_DSN/signoz_metadata
+    dsn: ${env:CLICKHOUSE_DSN}/signoz_metadata
     timeout: 10s
     tenant_id: ""
     cache:
       provider: in_memory
   signozclickhousemeter:
-    dsn: CODEFLY_CLICKHOUSE_DSN/signoz_meter
+    dsn: ${env:CLICKHOUSE_DSN}/signoz_meter
     timeout: 45s
     sending_queue:
       enabled: false
