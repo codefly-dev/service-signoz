@@ -57,8 +57,8 @@ func TestLocalStackAcceptsTraceAndSurvivesRestart(t *testing.T) {
 	})
 	docker(t, ctx,
 		"run", "-d", "--name", containerName,
-		"-p", fmt.Sprintf("127.0.0.1:%d:9000", nativePort),
-		"-p", fmt.Sprintf("127.0.0.1:%d:8123", httpPort),
+		"-p", fmt.Sprintf("%d:9000", nativePort),
+		"-p", fmt.Sprintf("%d:8123", httpPort),
 		"-e", "CLICKHOUSE_USER=signoz",
 		"-e", "CLICKHOUSE_PASSWORD="+password,
 		"-e", "CLICKHOUSE_DB=signoz",
