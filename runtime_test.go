@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
@@ -53,4 +54,18 @@ func TestCompanionClickHouseConfiguration(t *testing.T) {
 	require.Contains(t, string(config), "<keeper_server>")
 	require.Contains(t, string(config), "<cluster>")
 	require.Contains(t, string(config), "from_env=\"CLICKHOUSE_PASSWORD\"")
+}
+
+func TestRuntimeShutdownRemovesCollectorConfiguration(t *testing.T) {
+	runtime := NewRuntime()
+	configDir := filepath.Join(t.TempDir(), "collector-config")
+	runtime.configDir = configDir
+	require.NoError(t, os.Mkdir(configDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte("test"), 0o600))
+
+	require.NoError(t, runtime.shutdown(context.Background()))
+	_, err := os.Stat(configDir)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.Empty(t, runtime.configDir)
+	require.NoError(t, runtime.shutdown(context.Background()))
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -94,16 +95,24 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 	}
 
 	if err = s.initQuery(ctx, clickhouse, jwtSecret); err != nil {
-		return s.Runtime.InitError(err)
+		return s.initFailure(err)
 	}
 	if err = s.initCollector(ctx, clickhouse); err != nil {
-		_ = s.queryRunner.Shutdown(ctx)
-		return s.Runtime.InitError(err)
+		return s.initFailure(err)
 	}
 	if err = s.addRuntimeConfigurations(ctx); err != nil {
-		return s.Runtime.InitError(err)
+		return s.initFailure(err)
 	}
 	return s.Runtime.InitResponse()
+}
+
+func (s *Runtime) initFailure(cause error) (*runtimev0.InitResponse, error) {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.shutdown(cleanupCtx); err != nil {
+		cause = errors.Join(cause, fmt.Errorf("clean up after failed SigNoz initialization: %w", err))
+	}
+	return s.Runtime.InitError(cause)
 }
 
 func (s *Runtime) nativePort(ctx context.Context, req *runtimev0.InitRequest, endpoint *basev0.Endpoint) (uint16, error) {
@@ -185,6 +194,7 @@ func (s *Runtime) initQuery(ctx context.Context, clickhouse clickHouseConnection
 	if err != nil {
 		return err
 	}
+	s.queryRunner = runner
 	runner.WithPortMapping(ctx, s.queryPort, 8080)
 	if _, err = runner.WithPersistentCacheMount(ctx, "signoz-data", "/var/lib/signoz"); err != nil {
 		return err
@@ -200,7 +210,6 @@ func (s *Runtime) initQuery(ctx context.Context, clickhouse clickHouseConnection
 	if err = runner.Init(ctx); err != nil {
 		return err
 	}
-	s.queryRunner = runner
 	return nil
 }
 
@@ -209,6 +218,7 @@ func (s *Runtime) initCollector(ctx context.Context, clickhouse clickHouseConnec
 	if err != nil {
 		return err
 	}
+	s.configDir = configDir
 	collectorConfig, err := runtimeFS.ReadFile("runtime/otel-collector-config.yaml")
 	if err != nil {
 		return err
@@ -224,6 +234,7 @@ func (s *Runtime) initCollector(ctx context.Context, clickhouse clickHouseConnec
 	if err != nil {
 		return err
 	}
+	s.collectorRunner = runner
 	runner.WithPortMapping(ctx, s.otlpGRPCPort, 4317)
 	runner.WithPortMapping(ctx, s.otlpHTTPPort, 4318)
 	runner.WithPortMapping(ctx, s.healthPort, 13133)
@@ -235,8 +246,6 @@ func (s *Runtime) initCollector(ctx context.Context, clickhouse clickHouseConnec
 	if err = runner.Init(ctx); err != nil {
 		return err
 	}
-	s.configDir = configDir
-	s.collectorRunner = runner
 	return nil
 }
 
@@ -327,20 +336,42 @@ func (s *Runtime) Stop(context.Context, *runtimev0.StopRequest) (*runtimev0.Stop
 func (s *Runtime) Destroy(ctx context.Context, _ *runtimev0.DestroyRequest) (*runtimev0.DestroyResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
-	if s.uiProxy != nil {
-		_ = s.uiProxy.Shutdown(ctx)
+	if err := s.shutdown(ctx); err != nil {
+		return s.Runtime.DestroyError(err)
 	}
-	for _, runner := range []*dockerrun.DockerEnvironment{s.collectorRunner, s.queryRunner} {
-		if runner != nil {
-			if err := runner.Shutdown(ctx); err != nil {
-				return s.Runtime.DestroyError(err)
+	return s.Runtime.DestroyResponse()
+}
+
+func (s *Runtime) shutdown(ctx context.Context) error {
+	var errs []error
+	if s.uiProxy != nil {
+		if err := s.uiProxy.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("shut down UI proxy: %w", err))
+		}
+		s.uiProxy = nil
+	}
+	for _, runner := range []struct {
+		name   string
+		runner *dockerrun.DockerEnvironment
+	}{
+		{name: "collector", runner: s.collectorRunner},
+		{name: "query", runner: s.queryRunner},
+	} {
+		if runner.runner != nil {
+			if err := runner.runner.Shutdown(ctx); err != nil {
+				errs = append(errs, fmt.Errorf("shut down %s container: %w", runner.name, err))
 			}
 		}
 	}
+	s.collectorRunner = nil
+	s.queryRunner = nil
 	if s.configDir != "" {
-		_ = os.RemoveAll(s.configDir)
+		if err := os.RemoveAll(s.configDir); err != nil {
+			errs = append(errs, fmt.Errorf("remove collector configuration: %w", err))
+		}
+		s.configDir = ""
 	}
-	return s.Runtime.DestroyResponse()
+	return errors.Join(errs...)
 }
 
 func (s *Runtime) Information(ctx context.Context, req *runtimev0.InformationRequest) (*runtimev0.InformationResponse, error) {
