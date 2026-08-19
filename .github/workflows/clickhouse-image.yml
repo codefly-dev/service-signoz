@@ -30,4 +30,4 @@ jobs:
           provenance: mode=max
           sbom: true
           push: true
-          tags: ghcr.io/codefly-dev/service-signoz-clickhouse:25.12.5-1
+          tags: ghcr.io/codefly-dev/service-signoz/clickhouse:25.12.5-1
