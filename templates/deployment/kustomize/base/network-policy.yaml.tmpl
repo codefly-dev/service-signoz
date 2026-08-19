@@ -1,0 +1,63 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Name }}-default-deny
+  namespace: "{{ .Namespace }}"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: {{ .Name }}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Name }}-module-ingress
+  namespace: "{{ .Namespace }}"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: {{ .Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Name }}-internal-egress
+  namespace: "{{ .Namespace }}"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: {{ .Name }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: clickhouse
+      ports:
+        - protocol: TCP
+          port: 9000
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

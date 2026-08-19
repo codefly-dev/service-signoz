@@ -1,0 +1,26 @@
+name: {{ .Name }}
+version: 0.0.0
+module: {{ .Module }}
+agent:
+  kind: codefly:service
+  name: signoz
+  publisher: codefly.dev
+  version: 0.0.1
+service-dependencies:
+  - name: clickhouse
+    module: {{ .Module }}
+    endpoints:
+      - name: tcp
+endpoints:
+  - name: grpc
+    api: tcp
+    visibility: private
+  - name: http
+    api: tcp
+    visibility: private
+  - name: query
+    api: tcp
+    visibility: module
+  - name: web
+    api: tcp
+    visibility: module

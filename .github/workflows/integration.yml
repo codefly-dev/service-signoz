@@ -1,0 +1,30 @@
+name: integration
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  local-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Verify published ClickHouse image is public
+        run: docker pull ghcr.io/codefly-dev/service-signoz/clickhouse:25.12.5-1@sha256:a1a57d1d2ec9de0c7bba2e3b7aba52ec16773a0ba0b3b2230379e272f869484d
+      - name: Build qualified ClickHouse image
+        run: docker build -t service-signoz-clickhouse:integration clickhouse
+      - name: Exercise local SigNoz lifecycle
+        env:
+          CODEFLY_SIGNOZ_INTEGRATION: "1"
+          CODEFLY_SIGNOZ_CLICKHOUSE_IMAGE: service-signoz-clickhouse:integration
+        run: go test -run '^TestLocalStackAcceptsTraceAndSurvivesRestart$' -timeout 15m ./...

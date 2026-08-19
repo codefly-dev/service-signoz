@@ -1,0 +1,85 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Name }}-migrator-{{ .Deployment.Parameters.MigrationRevision }}
+  namespace: "{{ .Namespace }}"
+spec:
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Name }}
+        app.kubernetes.io/component: migrator
+        app.kubernetes.io/part-of: {{ .Name }}
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: ready
+          image: {{ .Deployment.Parameters.CollectorImage }}
+          imagePullPolicy: IfNotPresent
+          args: [migrate, ready]
+          env: &migration-env
+            - name: SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ (index .SecretReferences "CLICKHOUSE_DSN").Name }}
+                  key: {{ (index .SecretReferences "CLICKHOUSE_DSN").Key }}
+                  optional: {{ (index .SecretReferences "CLICKHOUSE_DSN").Optional }}
+            - name: SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_CLUSTER
+              value: cluster
+            - name: SIGNOZ_OTEL_COLLECTOR_TIMEOUT
+              value: 10m
+            - name: SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_REPLICATION
+              value: "false"
+          securityContext: &migration-security
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources: &migration-resources
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts: &migration-mounts
+            - name: tmp
+              mountPath: /tmp
+        - name: bootstrap
+          image: {{ .Deployment.Parameters.CollectorImage }}
+          imagePullPolicy: IfNotPresent
+          args: [migrate, bootstrap]
+          env: *migration-env
+          securityContext: *migration-security
+          resources: *migration-resources
+          volumeMounts: *migration-mounts
+        - name: sync
+          image: {{ .Deployment.Parameters.CollectorImage }}
+          imagePullPolicy: IfNotPresent
+          args: [migrate, sync, up]
+          env: *migration-env
+          securityContext: *migration-security
+          resources: *migration-resources
+          volumeMounts: *migration-mounts
+      containers:
+        - name: async
+          image: {{ .Deployment.Parameters.CollectorImage }}
+          imagePullPolicy: IfNotPresent
+          args: [migrate, async, up]
+          env: *migration-env
+          securityContext: *migration-security
+          resources: *migration-resources
+          volumeMounts: *migration-mounts
+      volumes:
+        - name: tmp
+          emptyDir: {}

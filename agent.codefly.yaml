@@ -1,0 +1,4 @@
+publisher: codefly.dev
+kind: codefly:service
+name: signoz
+version: 0.0.1
