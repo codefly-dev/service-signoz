@@ -22,6 +22,7 @@ import (
 	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
 	"github.com/codefly-dev/core/network"
 	"github.com/codefly-dev/core/resources"
+	dockerrun "github.com/codefly-dev/core/runners/dockerrun"
 	"github.com/codefly-dev/core/shared"
 	"github.com/stretchr/testify/require"
 	collecttracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -47,7 +48,7 @@ func TestLocalStackAcceptsTraceAndSurvivesRestart(t *testing.T) {
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
 	containerName := "codefly-signoz-clickhouse-" + suffix
 	volumeName := "codefly-signoz-clickhouse-data-" + suffix
-	password := "integration-password"
+	password := "integration-pa/ss"
 	docker(t, ctx, "volume", "create", volumeName)
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -57,8 +58,8 @@ func TestLocalStackAcceptsTraceAndSurvivesRestart(t *testing.T) {
 	})
 	docker(t, ctx,
 		"run", "-d", "--name", containerName,
-		"-p", fmt.Sprintf("%d:9000", nativePort),
-		"-p", fmt.Sprintf("%d:8123", httpPort),
+		"-p", fmt.Sprintf("127.0.0.1:%d:9000", nativePort),
+		"-p", fmt.Sprintf("127.0.0.1:%d:8123", httpPort),
 		"-e", "CLICKHOUSE_USER=signoz",
 		"-e", "CLICKHOUSE_PASSWORD="+password,
 		"-e", "CLICKHOUSE_DB=signoz",
@@ -71,20 +72,28 @@ func TestLocalStackAcceptsTraceAndSurvivesRestart(t *testing.T) {
 	root := t.TempDir()
 	identity, endpoints := createIntegrationService(t, ctx, root)
 	mappings := integrationNetworkMappings(t, ctx, identity, endpoints)
-	dependency := clickHouseConfiguration(nativePort, password)
+	dependencies := clickHouseConfigurations(nativePort, password)
 
-	first := startIntegrationRuntime(t, ctx, identity, mappings, dependency)
+	first := startIntegrationRuntime(t, ctx, identity, mappings, dependencies)
 	sendControlledTrace(t, ctx, first.otlpHTTPPort)
 	waitForTrace(t, ctx, httpPort, password)
 	requireHTTPStatus(t, ctx, fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", first.queryPort))
 	requireHTTPStatus(t, ctx, fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", first.uiPort))
-	require.NoError(t, destroyRuntime(ctx, first))
+	for _, port := range []uint16{first.otlpGRPCPort, first.otlpHTTPPort, first.queryPort, first.uiPort} {
+		requireContainerConnection(t, ctx, port)
+	}
+	destroyer := loadIntegrationRuntime(t, ctx, identity)
+	require.NoError(t, destroyRuntime(ctx, destroyer))
+	for _, component := range []string{"query", "collector"} {
+		requireDockerContainerMissing(t, ctx, dockerrun.ContainerName(first.UniqueWithWorkspace()+"-"+component))
+	}
+	require.NoError(t, first.shutdown(ctx, false))
 
 	docker(t, ctx, "restart", containerName)
 	waitForClickHouse(t, ctx, httpPort, password)
 	require.Greater(t, traceCount(t, ctx, httpPort, password), 0)
 
-	second := startIntegrationRuntime(t, ctx, identity, mappings, dependency)
+	second := startIntegrationRuntime(t, ctx, identity, mappings, dependencies)
 	t.Cleanup(func() { _ = destroyRuntime(context.Background(), second) })
 	require.Greater(t, traceCount(t, ctx, httpPort, password), 0)
 }
@@ -130,27 +139,27 @@ func integrationNetworkMappings(t *testing.T, ctx context.Context, identity *bas
 	return mappings
 }
 
-func clickHouseConfiguration(port int, password string) *basev0.Configuration {
-	return &basev0.Configuration{
-		Origin: "observability/clickhouse", RuntimeContext: resources.NewRuntimeContextContainer(),
-		Infos: []*basev0.ConfigurationInformation{{
-			Name: "clickhouse",
-			ConfigurationValues: []*basev0.ConfigurationValue{{
-				Key: "connection", Value: fmt.Sprintf("clickhouse://signoz:%s@host.docker.internal:%d/signoz", password, port), Secret: true,
+func clickHouseConfigurations(port int, password string) []*basev0.Configuration {
+	configuration := func(runtimeContext *basev0.RuntimeContext, host string) *basev0.Configuration {
+		return &basev0.Configuration{
+			Origin: "observability/clickhouse", RuntimeContext: runtimeContext,
+			Infos: []*basev0.ConfigurationInformation{{
+				Name: "clickhouse",
+				ConfigurationValues: []*basev0.ConfigurationValue{{
+					Key: "connection", Value: fmt.Sprintf("clickhouse://signoz:%s@%s:%d/signoz", password, host, port), Secret: true,
+				}},
 			}},
-		}},
+		}
+	}
+	return []*basev0.Configuration{
+		configuration(resources.NewRuntimeContextNative(), "127.0.0.1"),
+		configuration(resources.NewRuntimeContextContainer(), "host.docker.internal"),
 	}
 }
 
-func startIntegrationRuntime(t *testing.T, ctx context.Context, identity *basev0.ServiceIdentity, mappings []*basev0.NetworkMapping, dependency *basev0.Configuration) *Runtime {
+func startIntegrationRuntime(t *testing.T, ctx context.Context, identity *basev0.ServiceIdentity, mappings []*basev0.NetworkMapping, dependencies []*basev0.Configuration) *Runtime {
 	t.Helper()
-	runtime := NewRuntime()
-	environment := resources.LocalEnvironment()
-	loadResponse, err := runtime.Load(ctx, &runtimev0.LoadRequest{
-		Identity: identity, Environment: shared.Must(environment.Proto()), DisableCatch: true,
-	})
-	require.NoError(t, err)
-	require.NoError(t, services.ValidateRuntimeLoadResponse(loadResponse))
+	runtime := loadIntegrationRuntime(t, ctx, identity)
 	require.Len(t, runtime.Endpoints, 4)
 	initResponse, err := runtime.Init(ctx, &runtimev0.InitRequest{
 		RuntimeContext: resources.NewRuntimeContextFree(), ProposedNetworkMappings: mappings,
@@ -163,7 +172,7 @@ func startIntegrationRuntime(t *testing.T, ctx context.Context, identity *basev0
 				}},
 			}},
 		},
-		DependenciesConfigurations: []*basev0.Configuration{dependency},
+		DependenciesConfigurations: dependencies,
 	})
 	require.NoError(t, err)
 	require.NoError(t, services.ValidateRuntimeInitResponse(initResponse))
@@ -171,6 +180,32 @@ func startIntegrationRuntime(t *testing.T, ctx context.Context, identity *basev0
 	require.NoError(t, err)
 	require.NoError(t, services.ValidateRuntimeStartResponse(startResponse))
 	return runtime
+}
+
+func loadIntegrationRuntime(t *testing.T, ctx context.Context, identity *basev0.ServiceIdentity) *Runtime {
+	t.Helper()
+	runtime := NewRuntime()
+	environment := resources.LocalEnvironment()
+	loadResponse, err := runtime.Load(ctx, &runtimev0.LoadRequest{
+		Identity: identity, Environment: shared.Must(environment.Proto()), DisableCatch: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, services.ValidateRuntimeLoadResponse(loadResponse))
+	return runtime
+}
+
+func requireContainerConnection(t *testing.T, ctx context.Context, port uint16) {
+	t.Helper()
+	docker(t, ctx,
+		"run", "--rm", "--add-host", "host.docker.internal:host-gateway",
+		"alpine:3.20", "busybox", "nc", "-z", "-w", "5", "host.docker.internal", strconv.Itoa(int(port)),
+	)
+}
+
+func requireDockerContainerMissing(t *testing.T, ctx context.Context, name string) {
+	t.Helper()
+	output, err := exec.CommandContext(ctx, "docker", "inspect", name).CombinedOutput()
+	require.Error(t, err, "%s", strings.TrimSpace(string(output)))
 }
 
 func destroyRuntime(ctx context.Context, runtime *Runtime) error {
@@ -201,7 +236,7 @@ func sendControlledTrace(t *testing.T, ctx context.Context, port uint16) {
 	request.Header.Set("Content-Type", "application/x-protobuf")
 	response, err := http.DefaultClient.Do(request)
 	require.NoError(t, err)
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(response.Body)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, response.StatusCode, string(body))
@@ -232,7 +267,7 @@ func traceCount(t *testing.T, ctx context.Context, port int, password string) in
 	if err != nil {
 		return 0
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		return 0
 	}
@@ -272,7 +307,7 @@ func requireHTTPStatus(t *testing.T, ctx context.Context, address string) {
 	require.NoError(t, err)
 	response, err := http.DefaultClient.Do(request)
 	require.NoError(t, err)
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	require.Less(t, response.StatusCode, http.StatusInternalServerError)
 }
 
@@ -280,7 +315,7 @@ func freePort(t *testing.T) int {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	return listener.Addr().(*net.TCPAddr).Port
 }
 

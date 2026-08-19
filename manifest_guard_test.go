@@ -65,7 +65,26 @@ func TestRestrictedRenderIsDeterministicAndPrivate(t *testing.T) {
 	}
 }
 
+func TestMigrationJobIsRecreatedWhenItsInputsChange(t *testing.T) {
+	first := t.TempDir()
+	second := t.TempDir()
+	firstReferences := manifestSecretReferences()
+	secondReferences := manifestSecretReferences()
+	secondReferences["CLICKHOUSE_DSN"] = &builderv0.KubernetesSecretKeyReference{Name: "replacement-clickhouse", Key: "dsn"}
+
+	renderManifestsWithReferences(t, first, "test", "observability", builderv0.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_RESTRICTED_PORTABLE_V1, firstReferences)
+	renderManifestsWithReferences(t, second, "test", "observability", builderv0.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_RESTRICTED_PORTABLE_V1, secondReferences)
+
+	firstJob := readManifest(t, filepath.Join(first, "base", "migrator-job.yaml"))
+	secondJob := readManifest(t, filepath.Join(second, "base", "migrator-job.yaml"))
+	require.NotEqual(t, manifestString(t, firstJob, "metadata", "name"), manifestString(t, secondJob, "metadata", "name"))
+}
+
 func renderManifests(t *testing.T, destination, environment, namespace string, profile builderv0.KubernetesOutputProfile) *builderv0.KubernetesManifestValidation {
+	return renderManifestsWithReferences(t, destination, environment, namespace, profile, manifestSecretReferences())
+}
+
+func renderManifestsWithReferences(t *testing.T, destination, environment, namespace string, profile builderv0.KubernetesOutputProfile, references map[string]*builderv0.KubernetesSecretKeyReference) *builderv0.KubernetesManifestValidation {
 	t.Helper()
 	ctx := context.Background()
 	identity := &resources.ServiceIdentity{Workspace: "workspace", Module: "observability", Name: "signoz", Version: "0.0.0"}
@@ -80,21 +99,55 @@ func renderManifests(t *testing.T, destination, environment, namespace string, p
 	base.SetDockerImage(signozImage)
 	builder := &services.BuilderWrapper{Base: base}
 	base.Builder = builder
-	references := map[string]*builderv0.KubernetesSecretKeyReference{
-		"CLICKHOUSE_DSN":              {Name: "signoz-clickhouse", Key: "dsn"},
-		"SIGNOZ_TOKENIZER_JWT_SECRET": {Name: "signoz-runtime", Key: "jwt-secret"},
-	}
 	deployment := &builderv0.KubernetesDeployment{
 		Namespace: namespace, Destination: destination, Profile: profile, SecretReferences: references,
 	}
+	parameters := &DeploymentTemplateParameters{
+		SigNozImage: signozImage.FullName(), CollectorImage: collectorImage.FullName(),
+		MigrationRevision: migrationRevision(collectorImage.FullName(), references["CLICKHOUSE_DSN"]),
+	}
 	params := services.DeploymentParameters{
 		SecretReferences: references,
-		Parameters: DeploymentTemplateParameters{
-			SigNozImage: signozImage.FullName(), CollectorImage: collectorImage.FullName(),
-		},
+		Parameters:       parameters,
 	}
 	require.NoError(t, builder.KustomizeDeploy(ctx, &basev0.Environment{Name: environment}, deployment, deploymentFS, params))
 	return services.ValidateKubernetesManifestTree(ctx, destination, environment, namespace, profile, false, "", "")
+}
+
+func manifestSecretReferences() map[string]*builderv0.KubernetesSecretKeyReference {
+	return map[string]*builderv0.KubernetesSecretKeyReference{
+		"CLICKHOUSE_DSN":              {Name: "signoz-clickhouse", Key: "dsn"},
+		"SIGNOZ_TOKENIZER_JWT_SECRET": {Name: "signoz-runtime", Key: "jwt-secret"},
+	}
+}
+
+func readManifest(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	document := map[string]any{}
+	require.NoError(t, yaml.Unmarshal(data, &document))
+	return document
+}
+
+func manifestString(t *testing.T, manifest map[string]any, path ...string) string {
+	t.Helper()
+	value := manifestValue(t, manifest, path...)
+	result, ok := value.(string)
+	require.True(t, ok, "%v is not a string", path)
+	return result
+}
+
+func manifestValue(t *testing.T, manifest map[string]any, path ...string) any {
+	t.Helper()
+	var value any = manifest
+	for _, component := range path {
+		mapping, ok := value.(map[string]any)
+		require.True(t, ok, "%v is not a mapping", path)
+		value, ok = mapping[component]
+		require.True(t, ok, "%v is missing", path)
+	}
+	return value
 }
 
 func manifestContents(t *testing.T, root string) string {

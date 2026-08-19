@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+      - name: Verify published ClickHouse image is public
+        run: docker pull ghcr.io/codefly-dev/service-signoz/clickhouse:25.12.5-1@sha256:a1a57d1d2ec9de0c7bba2e3b7aba52ec16773a0ba0b3b2230379e272f869484d
       - name: Build qualified ClickHouse image
         run: docker build -t service-signoz-clickhouse:integration clickhouse
       - name: Exercise local SigNoz lifecycle

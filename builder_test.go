@@ -61,7 +61,10 @@ func TestReleasePinsAndUpgradeCoverage(t *testing.T) {
 	require.Contains(t, signozImage.FullName(), "@sha256:")
 	require.Contains(t, collectorImage.FullName(), "@sha256:")
 	require.Contains(t, clickHouseImage, "25.12.5-1@sha256:")
-	require.Equal(t, []string{"signoz/signoz:0.137.0", "signoz/signoz-otel-collector:0.144.8"}, upgradeSubjects())
+	require.Equal(t, []upgradeSubject{
+		{repository: "signoz/signoz", currentTag: "v0.137.0"},
+		{repository: "signoz/signoz-otel-collector", currentTag: "v0.144.8"},
+	}, upgradeSubjects())
 
 	manifest, err := os.ReadFile("agent.codefly.yaml")
 	require.NoError(t, err)
@@ -73,10 +76,39 @@ func TestReleasePinsAndUpgradeCoverage(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(gettingStarted), "version: "+clickHouseAgentVersion)
 	require.Contains(t, string(gettingStarted), clickHouseImage)
+	integrationWorkflow, err := os.ReadFile(".github/workflows/integration.yml")
+	require.NoError(t, err)
+	require.Contains(t, string(integrationWorkflow), clickHouseImage)
 	for _, path := range []string{
 		".goreleaser.yaml", ".github/workflows/ci.yml", ".github/workflows/releaser.yml", ".github/workflows/manifest-guard.yml",
 	} {
 		_, err = os.Stat(path)
 		require.NoError(t, err, path)
 	}
+}
+
+func TestUpgradeReportsVPrefixedSigNozTags(t *testing.T) {
+	builder := NewBuilder()
+	builder.tagSource = staticImageTagSource{
+		"signoz/signoz":                {"latest", "v1.0.0", "v0.137.1", "v0.137.1-linux-amd64"},
+		"signoz/signoz-otel-collector": {"v0.144.9", "v0.144.8"},
+	}
+
+	response, err := builder.Upgrade(context.Background(), &builderv0.UpgradeRequest{})
+	require.NoError(t, err)
+	require.Equal(t, builderv0.UpgradeStatus_SUCCESS, response.GetState().GetState())
+	require.Equal(t, []*builderv0.UpgradeChange{
+		{Package: "signoz/signoz", From: "v0.137.0", To: "v0.137.1"},
+		{Package: "signoz/signoz-otel-collector", From: "v0.144.8", To: "v0.144.9"},
+	}, response.GetChanges())
+
+	response, err = builder.Upgrade(context.Background(), &builderv0.UpgradeRequest{IncludeMajor: true})
+	require.NoError(t, err)
+	require.Equal(t, "v1.0.0", response.GetChanges()[0].GetTo())
+}
+
+type staticImageTagSource map[string][]string
+
+func (source staticImageTagSource) Tags(_ context.Context, repository string) ([]string, error) {
+	return source[repository], nil
 }

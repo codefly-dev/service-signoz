@@ -42,7 +42,7 @@ var collectorImage = &resources.DockerImage{
 	Digest: "sha256:6d1a59bc553e041014597eff0970608948c5c7447aaa984c4d109f2bc9f4062c",
 }
 
-const clickHouseImage = "ghcr.io/codefly-dev/service-signoz-clickhouse:25.12.5-1@sha256:b52688dbbda87eb8caeede1d9cb8704fbf8d13772148bb03500d929383209652"
+const clickHouseImage = "ghcr.io/codefly-dev/service-signoz/clickhouse:25.12.5-1@sha256:a1a57d1d2ec9de0c7bba2e3b7aba52ec16773a0ba0b3b2230379e272f869484d"
 
 type Settings struct{}
 

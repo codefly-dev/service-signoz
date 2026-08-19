@@ -5,13 +5,14 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,20 +30,36 @@ type clickHouseConnection struct {
 	Password string
 }
 
+type clickHouseDependency struct {
+	Native    clickHouseConnection
+	Container clickHouseConnection
+}
+
+type tcpRelay struct {
+	listener net.Listener
+	target   string
+	allowed  []*net.IPNet
+}
+
 type Runtime struct {
 	services.RuntimeServer
 	*Service
 
 	queryRunner     *dockerrun.DockerEnvironment
 	collectorRunner *dockerrun.DockerEnvironment
-	uiProxy         *http.Server
 	configDir       string
+	dependencyRelay *tcpRelay
+	endpointRelays  []*tcpRelay
 
 	queryPort    uint16
 	uiPort       uint16
 	otlpGRPCPort uint16
 	otlpHTTPPort uint16
-	healthPort   uint16
+
+	queryBackendPort    uint16
+	otlpGRPCBackendPort uint16
+	otlpHTTPBackendPort uint16
+	healthPort          uint16
 }
 
 func NewRuntime() *Runtime {
@@ -78,20 +95,49 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 	if s.uiPort, err = s.nativePort(ctx, req, s.uiEndpoint); err != nil {
 		return s.Runtime.InitError(err)
 	}
-	if s.healthPort, err = freeLocalPort(); err != nil {
-		return s.Runtime.InitError(err)
+	excludedPorts := map[uint16]struct{}{s.otlpGRPCPort: {}, s.otlpHTTPPort: {}, s.queryPort: {}, s.uiPort: {}}
+	for _, backend := range []struct {
+		port *uint16
+		name string
+	}{
+		{port: &s.queryBackendPort, name: "query"},
+		{port: &s.otlpGRPCBackendPort, name: "OTLP/gRPC"},
+		{port: &s.otlpHTTPBackendPort, name: "OTLP/HTTP"},
+		{port: &s.healthPort, name: "collector health"},
+	} {
+		if *backend.port, err = freeLocalPortExcluding(excludedPorts); err != nil {
+			return s.Runtime.InitError(fmt.Errorf("allocate %s backend port: %w", backend.name, err))
+		}
+		excludedPorts[*backend.port] = struct{}{}
 	}
 	jwtSecret, err := resources.GetConfigurationValue(ctx, req.GetConfiguration(), "signoz", "SIGNOZ_TOKENIZER_JWT_SECRET")
 	if err != nil || jwtSecret == "" {
 		return s.Runtime.InitError(fmt.Errorf("SigNoz requires SIGNOZ_TOKENIZER_JWT_SECRET in its service configuration"))
 	}
 
-	clickhouse, err := parseClickHouseDependency(ctx, req.DependenciesConfigurations)
+	dependency, err := parseClickHouseDependency(ctx, req.DependenciesConfigurations)
 	if err != nil {
 		return s.Runtime.InitError(err)
 	}
+	clickhouse := dependency.Container
+	if dependency.Container.Host == "host.docker.internal" {
+		allowed, sourceErr := dockerSourceNetworks(ctx)
+		if sourceErr != nil {
+			return s.Runtime.InitError(sourceErr)
+		}
+		relay, relayErr := startTCPRelay(
+			"0.0.0.0:0",
+			net.JoinHostPort(dependency.Native.Host, dependency.Native.Port),
+			allowed,
+		)
+		if relayErr != nil {
+			return s.Runtime.InitError(fmt.Errorf("expose ClickHouse to service containers: %w", relayErr))
+		}
+		s.dependencyRelay = relay
+		clickhouse.Port = strconv.Itoa(relay.listener.Addr().(*net.TCPAddr).Port)
+	}
 	if err = runMigrations(ctx, clickhouse); err != nil {
-		return s.Runtime.InitError(err)
+		return s.initFailure(err)
 	}
 
 	if err = s.initQuery(ctx, clickhouse, jwtSecret); err != nil {
@@ -109,7 +155,7 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 func (s *Runtime) initFailure(cause error) (*runtimev0.InitResponse, error) {
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := s.shutdown(cleanupCtx); err != nil {
+	if err := s.shutdown(cleanupCtx, false); err != nil {
 		cause = errors.Join(cause, fmt.Errorf("clean up after failed SigNoz initialization: %w", err))
 	}
 	return s.Runtime.InitError(cause)
@@ -128,35 +174,75 @@ func freeLocalPort() (uint16, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	return uint16(listener.Addr().(*net.TCPAddr).Port), nil
 }
 
-func parseClickHouseDependency(ctx context.Context, configurations []*basev0.Configuration) (clickHouseConnection, error) {
-	for _, configuration := range resources.FilterConfigurations(configurations, resources.NewRuntimeContextContainer()) {
+func freeLocalPortExcluding(excluded map[uint16]struct{}) (uint16, error) {
+	for {
+		port, err := freeLocalPort()
+		if err != nil {
+			return 0, err
+		}
+		if _, found := excluded[port]; !found {
+			return port, nil
+		}
+	}
+}
+
+func parseClickHouseDependency(ctx context.Context, configurations []*basev0.Configuration) (clickHouseDependency, error) {
+	native, err := clickHouseConnectionForRuntime(ctx, configurations, resources.NewRuntimeContextNative())
+	if err != nil {
+		return clickHouseDependency{}, err
+	}
+	container, err := clickHouseConnectionForRuntime(ctx, configurations, resources.NewRuntimeContextContainer())
+	if err != nil {
+		return clickHouseDependency{}, err
+	}
+	return clickHouseDependency{Native: native, Container: container}, nil
+}
+
+func clickHouseConnectionForRuntime(ctx context.Context, configurations []*basev0.Configuration, runtimeContext *basev0.RuntimeContext) (clickHouseConnection, error) {
+	for _, configuration := range resources.FilterConfigurations(configurations, runtimeContext) {
 		connection, err := resources.GetConfigurationValue(ctx, configuration, "clickhouse", "connection")
 		if err != nil || connection == "" {
 			continue
 		}
-		parsed, err := url.Parse(connection)
-		if err != nil {
-			return clickHouseConnection{}, fmt.Errorf("parse ClickHouse dependency connection: %w", err)
-		}
-		if parsed.Scheme != "clickhouse" && parsed.Scheme != "tcp" {
-			return clickHouseConnection{}, fmt.Errorf("unsupported ClickHouse connection scheme %q", parsed.Scheme)
-		}
-		if parsed.User == nil {
-			return clickHouseConnection{}, fmt.Errorf("ClickHouse dependency connection is incomplete")
-		}
-		password, _ := parsed.User.Password()
-		if parsed.User.Username() == "" || password == "" || parsed.Hostname() == "" || parsed.Port() == "" {
-			return clickHouseConnection{}, fmt.Errorf("ClickHouse dependency connection is incomplete")
-		}
-		return clickHouseConnection{
-			Host: parsed.Hostname(), Port: parsed.Port(), User: parsed.User.Username(), Password: password,
-		}, nil
+		return parseClickHouseConnection(connection)
 	}
-	return clickHouseConnection{}, fmt.Errorf("SigNoz requires the clickhouse/connection dependency configuration for the container runtime")
+	return clickHouseConnection{}, fmt.Errorf("SigNoz requires the clickhouse/connection dependency configuration for the %s runtime", runtimeContext.Kind)
+}
+
+func parseClickHouseConnection(connection string) (clickHouseConnection, error) {
+	scheme, authority, found := strings.Cut(connection, "://")
+	if !found || (scheme != "clickhouse" && scheme != "tcp") {
+		return clickHouseConnection{}, fmt.Errorf("unsupported ClickHouse connection scheme %q", scheme)
+	}
+	credentials, hostPath, found := strings.Cut(authority, "@")
+	if !found {
+		return clickHouseConnection{}, fmt.Errorf("ClickHouse dependency connection is incomplete")
+	}
+	if lastAt := strings.LastIndex(authority, "@"); lastAt >= 0 {
+		credentials, hostPath = authority[:lastAt], authority[lastAt+1:]
+	}
+	username, password, found := strings.Cut(credentials, ":")
+	if !found || username == "" || password == "" {
+		return clickHouseConnection{}, fmt.Errorf("ClickHouse dependency connection is incomplete")
+	}
+	hostPort, _, _ := strings.Cut(hostPath, "/")
+	host, port, err := net.SplitHostPort(hostPort)
+	if err != nil || host == "" || port == "" {
+		return clickHouseConnection{}, fmt.Errorf("ClickHouse dependency connection is incomplete")
+	}
+	return clickHouseConnection{Host: host, Port: port, User: decodeUserInfo(username), Password: decodeUserInfo(password)}, nil
+}
+
+func decodeUserInfo(value string) string {
+	decoded, err := url.PathUnescape(value)
+	if err != nil {
+		return value
+	}
+	return decoded
 }
 
 func runMigrations(ctx context.Context, clickhouse clickHouseConnection) error {
@@ -195,7 +281,7 @@ func (s *Runtime) initQuery(ctx context.Context, clickhouse clickHouseConnection
 		return err
 	}
 	s.queryRunner = runner
-	runner.WithPortMapping(ctx, s.queryPort, 8080)
+	runner.WithPortMapping(ctx, s.queryBackendPort, 8080)
 	if _, err = runner.WithPersistentCacheMount(ctx, "signoz-data", "/var/lib/signoz"); err != nil {
 		return err
 	}
@@ -235,8 +321,8 @@ func (s *Runtime) initCollector(ctx context.Context, clickhouse clickHouseConnec
 		return err
 	}
 	s.collectorRunner = runner
-	runner.WithPortMapping(ctx, s.otlpGRPCPort, 4317)
-	runner.WithPortMapping(ctx, s.otlpHTTPPort, 4318)
+	runner.WithPortMapping(ctx, s.otlpGRPCBackendPort, 4317)
+	runner.WithPortMapping(ctx, s.otlpHTTPBackendPort, 4318)
 	runner.WithPortMapping(ctx, s.healthPort, 13133)
 	runner.WithMount(configDir, "/conf")
 	runner.WithEnvironmentVariables(ctx, resources.Env("CLICKHOUSE_DSN", baseDSN))
@@ -252,7 +338,7 @@ func (s *Runtime) initCollector(ctx context.Context, clickhouse clickHouseConnec
 func (s *Runtime) addRuntimeConfigurations(ctx context.Context) error {
 	endpoints := []*basev0.Endpoint{s.otlpGRPCEndpoint, s.otlpHTTPEndpoint, s.queryEndpoint, s.uiEndpoint}
 	for _, runtimeContext := range []*basev0.RuntimeContext{resources.NewRuntimeContextNative(), resources.NewRuntimeContextContainer()} {
-		configuration := &basev0.Configuration{Origin: s.Base.Unique(), RuntimeContext: runtimeContext}
+		configuration := &basev0.Configuration{Origin: s.Unique(), RuntimeContext: runtimeContext}
 		for _, endpoint := range endpoints {
 			mapping, err := resources.FindNetworkMapping(ctx, s.NetworkMappings, endpoint)
 			if err != nil {
@@ -282,24 +368,48 @@ func (s *Runtime) addRuntimeConfigurations(ctx context.Context) error {
 func (s *Runtime) Start(ctx context.Context, _ *runtimev0.StartRequest) (*runtimev0.StartResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
-	if err := waitForHTTP(ctx, fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", s.queryPort)); err != nil {
+	if err := waitForHTTP(ctx, fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", s.queryBackendPort)); err != nil {
 		return s.Runtime.StartError(err)
 	}
 	if err := waitForHTTP(ctx, fmt.Sprintf("http://127.0.0.1:%d/", s.healthPort)); err != nil {
 		return s.Runtime.StartError(err)
 	}
-	proxyTarget, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", s.queryPort))
-	s.uiProxy = &http.Server{
-		Addr:              fmt.Sprintf("127.0.0.1:%d", s.uiPort),
-		Handler:           httputil.NewSingleHostReverseProxy(proxyTarget),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	listener, err := net.Listen("tcp", s.uiProxy.Addr)
-	if err != nil {
+	if err := s.startEndpointRelays(ctx); err != nil {
 		return s.Runtime.StartError(err)
 	}
-	go func() { _ = s.uiProxy.Serve(listener) }()
 	return s.Runtime.StartResponse()
+}
+
+func (s *Runtime) startEndpointRelays(ctx context.Context) error {
+	if len(s.endpointRelays) > 0 {
+		return nil
+	}
+	allowed, err := dockerSourceNetworks(ctx)
+	if err != nil {
+		return err
+	}
+	for _, endpoint := range []struct {
+		port   uint16
+		target uint16
+	}{
+		{port: s.otlpGRPCPort, target: s.otlpGRPCBackendPort},
+		{port: s.otlpHTTPPort, target: s.otlpHTTPBackendPort},
+		{port: s.queryPort, target: s.queryBackendPort},
+		{port: s.uiPort, target: s.queryBackendPort},
+	} {
+		relay, relayErr := startTCPRelay(
+			net.JoinHostPort("0.0.0.0", strconv.Itoa(int(endpoint.port))),
+			net.JoinHostPort("127.0.0.1", strconv.Itoa(int(endpoint.target))),
+			allowed,
+		)
+		if relayErr != nil {
+			_ = closeTCPRelays(s.endpointRelays)
+			s.endpointRelays = nil
+			return fmt.Errorf("expose SigNoz endpoint %d to module containers: %w", endpoint.port, relayErr)
+		}
+		s.endpointRelays = append(s.endpointRelays, relay)
+	}
+	return nil
 }
 
 func waitForHTTP(ctx context.Context, address string) error {
@@ -336,29 +446,37 @@ func (s *Runtime) Stop(context.Context, *runtimev0.StopRequest) (*runtimev0.Stop
 func (s *Runtime) Destroy(ctx context.Context, _ *runtimev0.DestroyRequest) (*runtimev0.DestroyResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
-	if err := s.shutdown(ctx); err != nil {
+	if err := s.shutdown(ctx, true); err != nil {
 		return s.Runtime.DestroyError(err)
 	}
 	return s.Runtime.DestroyResponse()
 }
 
-func (s *Runtime) shutdown(ctx context.Context) error {
+func (s *Runtime) shutdown(ctx context.Context, discoverRunners bool) error {
 	var errs []error
-	if s.uiProxy != nil {
-		if err := s.uiProxy.Shutdown(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("shut down UI proxy: %w", err))
-		}
-		s.uiProxy = nil
+	if err := closeTCPRelays(s.endpointRelays); err != nil {
+		errs = append(errs, fmt.Errorf("shut down endpoint relays: %w", err))
 	}
+	s.endpointRelays = nil
 	for _, runner := range []struct {
-		name   string
-		runner *dockerrun.DockerEnvironment
+		name    string
+		image   *resources.DockerImage
+		current *dockerrun.DockerEnvironment
 	}{
-		{name: "collector", runner: s.collectorRunner},
-		{name: "query", runner: s.queryRunner},
+		{name: "collector", image: collectorImage, current: s.collectorRunner},
+		{name: "query", image: signozImage, current: s.queryRunner},
 	} {
-		if runner.runner != nil {
-			if err := runner.runner.Shutdown(ctx); err != nil {
+		current := runner.current
+		if current == nil && discoverRunners {
+			var err error
+			current, err = dockerrun.NewDockerHeadlessEnvironment(ctx, runner.image, s.UniqueWithWorkspace()+"-"+runner.name)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("find %s container: %w", runner.name, err))
+				continue
+			}
+		}
+		if current != nil {
+			if err := current.Shutdown(ctx); err != nil {
 				errs = append(errs, fmt.Errorf("shut down %s container: %w", runner.name, err))
 			}
 		}
@@ -370,6 +488,108 @@ func (s *Runtime) shutdown(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("remove collector configuration: %w", err))
 		}
 		s.configDir = ""
+	}
+	if s.dependencyRelay != nil {
+		if err := s.dependencyRelay.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("shut down ClickHouse relay: %w", err))
+		}
+		s.dependencyRelay = nil
+	}
+	return errors.Join(errs...)
+}
+
+func dockerSourceNetworks(ctx context.Context) ([]*net.IPNet, error) {
+	// Relays listen on all host interfaces because Docker Desktop cannot route
+	// containers to host loopback; accepting only loopback and bridge sources
+	// keeps the service unavailable to other hosts.
+	command := exec.CommandContext(ctx, "docker", "network", "inspect", "bridge", "--format", "{{range .IPAM.Config}}{{println .Subnet}}{{end}}")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("inspect Docker bridge network: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	_, loopback, _ := net.ParseCIDR("127.0.0.0/8")
+	networks := []*net.IPNet{loopback}
+	for _, subnet := range strings.Fields(string(output)) {
+		_, network, parseErr := net.ParseCIDR(subnet)
+		if parseErr != nil {
+			return nil, fmt.Errorf("docker bridge returned invalid subnet %q", subnet)
+		}
+		networks = append(networks, network)
+	}
+	if len(networks) == 1 {
+		return nil, fmt.Errorf("docker bridge returned no source subnets")
+	}
+	return networks, nil
+}
+
+func startTCPRelay(listenAddress, target string, allowed []*net.IPNet) (*tcpRelay, error) {
+	listener, err := net.Listen("tcp", listenAddress)
+	if err != nil {
+		return nil, err
+	}
+	relay := &tcpRelay{listener: listener, target: target, allowed: allowed}
+	go relay.serve()
+	return relay, nil
+}
+
+func (relay *tcpRelay) serve() {
+	for {
+		connection, err := relay.listener.Accept()
+		if err != nil {
+			return
+		}
+		if !relay.allows(connection.RemoteAddr()) {
+			_ = connection.Close()
+			continue
+		}
+		go relay.forward(connection)
+	}
+}
+
+func (relay *tcpRelay) allows(address net.Addr) bool {
+	tcpAddress, ok := address.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	for _, network := range relay.allowed {
+		if network.Contains(tcpAddress.IP) {
+			return true
+		}
+	}
+	return false
+}
+
+func (relay *tcpRelay) forward(connection net.Conn) {
+	defer func() { _ = connection.Close() }()
+	upstream, err := net.Dial("tcp", relay.target)
+	if err != nil {
+		return
+	}
+	defer func() { _ = upstream.Close() }()
+
+	done := make(chan struct{}, 2)
+	copyConnection := func(destination io.Writer, source io.Reader) {
+		_, _ = io.Copy(destination, source)
+		done <- struct{}{}
+	}
+	go copyConnection(upstream, connection)
+	go copyConnection(connection, upstream)
+	<-done
+}
+
+func (relay *tcpRelay) Close() error {
+	if err := relay.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	return nil
+}
+
+func closeTCPRelays(relays []*tcpRelay) error {
+	var errs []error
+	for _, relay := range relays {
+		if relay != nil {
+			errs = append(errs, relay.Close())
+		}
 	}
 	return errors.Join(errs...)
 }
